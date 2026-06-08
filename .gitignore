@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# uv
+.python-version
+
+# Environment variables (never commit secrets)
+.env
+
+# pgAdmin
+*.db
+
+# OS
+.DS_Store
+Thumbs.db

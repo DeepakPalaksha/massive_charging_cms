@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+
+  # ── PostgreSQL Database ──────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: massive_charging_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: massive_charging
+    ports:
+      - "5432:5432"             # Expose to localhost so Python can connect
+    volumes:
+      - postgres_data:/var/lib/postgresql/data        # Persist data across restarts
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql  # Auto-run schema on first start
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── pgAdmin (Visual Database Browser) ───────────────────────
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: massive_charging_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@massivecharging.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"               # Open browser at localhost:5050
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:                # Named volume — data survives docker-compose down
