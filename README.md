@@ -1,29 +1,183 @@
-# Massive Charging CMS — Local Development Setup
+# Massive Charging CMS — Local Simulation
 
-A working simulation of a Charge Management System (CMS) built on PostgreSQL.
-Demonstrates session state machine, edge case handling, and billing logic.
+A working simulation of a **Charge Management System (CMS)** built entirely on PostgreSQL.
 
----
-
-## What this project demonstrates
-
-- OCPP session state machine: `preparing → charging → suspended → finishing → complete`
-- Edge case: 4G drop mid-session with reconnect and reconciliation
-- Edge case: 4G drop with no reconnect and estimated billing
-- Audit trail: complete event log for every session
-- PostgreSQL as single source of truth (no Redis, no Kafka)
+Built to demonstrate how a production EV charging backend handles session lifecycle, billing, and failure recovery — without Redis, without Kafka, without over-engineering.
 
 ---
 
-## Prerequisites
+## What problem does this solve?
 
-Make sure you have these installed:
+EV chargers on highway corridors face three hard problems:
 
-| Tool | Version | Check |
-|------|---------|-------|
-| Docker Desktop | Latest | `docker --version` |
-| Python | 3.11+ | `python --version` |
-| uv | Latest | `uv --version` |
+1. **Unreliable 4G connectivity** — chargers drop mid-session
+2. **Billing accuracy** — customers must be billed correctly even when connections fail
+3. **Scale** — 200 chargers today, 2,000 tomorrow, without rebuilding the system
+
+This project demonstrates a PostgreSQL-native architecture that solves all three.
+
+---
+
+## Architecture in one diagram
+
+```
+Physical Charger (highway)
+        │
+        │  WebSocket (OCPP 1.6)
+        │  wss://cms.massivecharging.com/ocpp/CH-001
+        ▼
+┌─────────────────────────┐
+│   FastAPI Gateway        │   ← In production: EC2 t3.medium
+│   (websocket_simulator   │     Accepts OCPP WebSocket connections
+│    replaces this locally)│     Routes messages to CMS backend
+└──────────┬──────────────┘
+           │
+           │  Function calls
+           ▼
+┌─────────────────────────┐
+│   CMS Backend            │   ← cms_backend.py
+│   State Machine          │     7 functions, each wrapping a
+│   Business Logic         │     state transition in a transaction
+└──────────┬──────────────┘
+           │
+           │  SQL (psycopg2)
+           ▼
+┌─────────────────────────┐
+│   PostgreSQL             │   ← In production: AWS RDS t3.medium
+│   Single source of truth │     5 tables, indexed for fast reads
+│   (Docker locally)       │     67 writes/second at 2,000 sessions
+└─────────────────────────┘
+```
+
+---
+
+## The state machine
+
+Every charging session follows a strict state machine:
+
+```
+idle
+  │
+  │ vehicle plugs in
+  ▼
+preparing
+  │
+  │ payment confirmed
+  ▼
+charging ──────────────────────────────────► suspect
+  │          4G drops, no MeterValues                │
+  │          for 5 minutes                           │
+  │ vehicle unplugs                                  │ charger reconnects
+  ▼          OR alert worker closes after 30 min     │ with real final value
+finishing ◄─────────────────────────────────────────┘
+  │
+  ▼
+complete
+  │
+  ▼
+billing triggered (pending → completed / failed)
+```
+
+**Suspect state** is the key innovation:
+- Session does not close when 4G drops
+- System estimates final energy from last known power × time elapsed
+- When charger reconnects, estimated value is reconciled against actual
+- If charger never reconnects, session closes with estimated billing and ops flag
+
+---
+
+## The five database tables
+
+```
+charger_config      One row per physical charger
+                    Stores site, power limit, OCPP version
+                    Read frequently, written rarely
+
+sessions            One row per charging session
+                    Tracks current state, energy, amount
+                    Updated on every MeterValues message
+                    The real-time heartbeat of the system
+
+session_events      One row per event inside a session
+                    Append-only — never updated, never deleted
+                    Complete audit trail for billing disputes
+                    MeterValues, status changes, errors, reconciliations
+
+command_queue       Commands waiting to be sent to chargers
+                    RemoteStop, SetChargingProfile, Reset
+                    Gateway reads this and pushes commands over WebSocket
+
+billing             One row per completed session
+                    Separate from sessions so billing failure
+                    never blocks session closure
+```
+
+---
+
+## Three scenarios simulated
+
+### Scenario 1: Happy path
+```
+Vehicle plugs in → driver pays → charges for 5 minutes → unplugs
+Result: session complete, is_estimated=False, billing=pending
+```
+
+### Scenario 2: 4G drop — charger reconnects
+```
+Vehicle plugs in → charges for 3 minutes → 4G drops
+→ session marked suspect with estimated energy
+→ charger reconnects with real final meter value
+→ estimated reconciled against actual
+Result: session complete, is_estimated=False (reconciled to real value)
+```
+
+### Scenario 3: 4G drop — charger never reconnects
+```
+Vehicle plugs in → charges for 2 minutes → 4G drops
+→ session marked suspect
+→ 30 minutes pass, charger still offline
+→ alert worker closes session with estimated billing
+Result: session complete, is_estimated=True (flagged for ops review)
+```
+
+---
+
+## Key engineering decisions
+
+### Why PostgreSQL only (no Redis)?
+
+2,000 sessions × 1 MeterValues per 30 seconds = **67 writes per second**.
+
+AWS RDS PostgreSQL on a `db.t3.medium` handles **1,000–3,000 writes per second** comfortably. We are at 5% of capacity.
+
+Redis solves a problem we don't have. It would add operational overhead — another service to monitor, another failure point — without solving anything real at this scale.
+
+**Scaling trigger:** When PostgreSQL CPU hits 70% sustained, add a read replica. Workers and dashboard read from the replica. Gateway writes to primary.
+
+### Why two tables (sessions + session_events)?
+
+`sessions` is sparse and fast — it holds only the current state. Dashboard and workers query this table.
+
+`session_events` is the audit trail — append-only, one row per event. Used only when you need to reconstruct what happened (billing dispute, charger debugging, ops investigation).
+
+A customer dispute about billing can be resolved by replaying the complete event log for that session. Without this, you're guessing.
+
+### Why no Kafka?
+
+Kafka is the right tool at 50,000+ sessions with 5+ engineering teams. At 2,000 sessions with one team, Kafka adds:
+- A new service to operate and monitor
+- A new failure mode
+- Operational expertise your team doesn't have yet
+
+PostgreSQL LISTEN/NOTIFY gives real-time behaviour from the database you're already running.
+
+### Why PgBouncer matters more than instance size?
+
+PostgreSQL has a default limit of 100 simultaneous connections. With 2,000 chargers sending messages simultaneously, you'd exhaust this instantly.
+
+PgBouncer is a connection pooler that sits between FastAPI and PostgreSQL. It maintains 20–30 real database connections and queues the rest. PostgreSQL never sees more than 30 connections.
+
+This is a configuration change, not a hardware upgrade.
 
 ---
 
@@ -31,33 +185,51 @@ Make sure you have these installed:
 
 ```
 massive_charging_cms/
-├── docker-compose.yml       # PostgreSQL + pgAdmin containers
-├── schema.sql               # Database tables (auto-runs on first start)
-├── cms_backend.py           # State machine logic
-├── websocket_simulator.py   # Simulates charger behavior (3 scenarios)
-├── pyproject.toml           # Python dependencies (managed by uv)
-└── README.md                # This file
+├── docker-compose.yml        PostgreSQL (port 5432) + pgAdmin (port 5050)
+├── schema.sql                Five tables with indexes and seed data
+│                             Auto-runs when Docker starts
+├── cms_backend.py            State machine logic
+│                             7 functions, each a state transition
+│                             Every write wrapped in a transaction
+├── websocket_simulator.py    Simulates three charger scenarios
+│                             Calls cms_backend functions directly
+│                             (replaces FastAPI gateway locally)
+├── pyproject.toml            Python dependencies managed by uv
+├── uv.lock                   Exact dependency versions locked
+└── README.md                 This file
 ```
 
 ---
 
-## Setup (one time only)
+## Prerequisites
 
-### Step 1: Clone or create the project folder
+| Tool | Version | Install |
+|------|---------|---------|
+| Docker Desktop | Latest | https://docker.com |
+| Python | 3.11+ | https://python.org |
+| uv | Latest | `pip install uv` |
+| Git | Any | https://git-scm.com |
+
+---
+
+## Setup
+
+### 1. Clone the repository
 
 ```bash
-mkdir massive_charging_cms
+git clone https://github.com/DeepakPalaksha/massive_charging_cms.git
 cd massive_charging_cms
 ```
 
-### Step 2: Initialize Python project with uv
+### 2. Install Python dependencies
 
 ```bash
-uv init
-uv add psycopg2-binary python-dateutil
+uv sync
 ```
 
-### Step 3: Start PostgreSQL and pgAdmin
+This reads `pyproject.toml`, creates a virtual environment in `.venv`, and installs all dependencies. No manual pip install needed.
+
+### 3. Start PostgreSQL and pgAdmin
 
 ```bash
 docker-compose up -d
@@ -69,40 +241,24 @@ Expected output:
 ✔ Container massive_charging_pgadmin  Running
 ```
 
-### Step 4: Verify database tables were created
+`schema.sql` runs automatically on first start. All five tables and seed data are created.
+
+### 4. Verify the database
 
 ```bash
 docker exec -it massive_charging_db psql -U postgres -d massive_charging
 ```
 
 Inside psql:
+
 ```sql
+-- Check tables exist
 \dt
-```
 
-Expected output:
-```
- billing
- charger_config
- command_queue
- session_events
- sessions
-```
+-- Check seed data
+SELECT charger_id, site_name, power_limit_kw FROM charger_config;
 
-Check seed data:
-```sql
-SELECT charger_id, site_name FROM charger_config;
-```
-
-Expected output:
-```
- CH-001 | Mumbai-Pune Highway KM 45
- CH-002 | Mumbai-Pune Highway KM 45
- CH-003 | Bangalore-Chennai Highway KM 120
-```
-
-Exit psql:
-```sql
+-- Exit
 \q
 ```
 
@@ -114,74 +270,49 @@ Exit psql:
 uv run python websocket_simulator.py
 ```
 
-### What you will see:
-
-**Scenario 1 — Happy Path:**
-```
-[STEP 1] Vehicle plugs into CH-001
-[STEP 2] Authorization confirmed
-[STEP 3] MeterValues every 30 seconds (10 messages)
-[STEP 4] StopTransaction — session complete
-Status: complete | Energy: X kWh | ₹XXX | Is estimated: False
-```
-
-**Scenario 2 — 4G Drop, Charger Reconnects:**
-```
-[STEP 1] Vehicle plugs into CH-002
-[STEP 2] Authorization confirmed
-[STEP 3] MeterValues for 3 minutes (normal)
-[STEP 4] CONNECTION DROPS → session marked suspect
-         Estimated energy: X kWh | ₹XXX
-[STEP 5] Charger reconnects with real final value
-         Reconciled: estimated vs actual diff = X kWh
-Status: complete | Is estimated: False ← reconciled to actual
-```
-
-**Scenario 3 — 4G Drop, Never Reconnects:**
-```
-[STEP 1] Vehicle plugs into CH-003
-[STEP 2] Authorization confirmed
-[STEP 3] MeterValues for 2 minutes
-[STEP 4] CONNECTION DROPS → session marked suspect
-[STEP 5] Alert worker closes session with estimate
-Status: complete | Is estimated: True ← flagged for ops review
-```
+The simulator runs all three scenarios and prints:
+- Session UUID for each scenario
+- Status at each step
+- Energy and billing amounts
+- Reconciliation result for suspect sessions
+- Complete event log for each session
+- Final check: zero suspect sessions remaining
 
 ---
 
 ## Inspecting the database visually
 
-Open pgAdmin in your browser:
+Open pgAdmin at `http://localhost:5050`
 
 ```
-URL:      http://localhost:5050
 Email:    admin@massivecharging.com
 Password: admin
 ```
 
-### Connect pgAdmin to your database:
+### Connect pgAdmin to PostgreSQL:
 
 1. Right click **Servers** → **Register** → **Server**
-2. **Name:** massive_charging
-3. Click **Connection** tab:
-   - **Host:** massive_charging_db
-   - **Port:** 5432
-   - **Database:** massive_charging
-   - **Username:** postgres
-   - **Password:** postgres
+2. **General tab** → Name: `massive_charging`
+3. **Connection tab:**
+   - Host: `massive_charging_db`
+   - Port: `5432`
+   - Database: `massive_charging`
+   - Username: `postgres`
+   - Password: `postgres`
 4. Click **Save**
 
-### Useful queries to run in pgAdmin Query Tool:
+### Useful queries (Tools → Query Tool):
 
-**See all sessions:**
+**All sessions with status and billing:**
 ```sql
-SELECT session_uuid, charger_id, status, 
-       total_energy_kwh, total_amount_inr, is_estimated
+SELECT session_uuid, charger_id, status,
+       total_energy_kwh, total_amount_inr,
+       is_estimated, billing_status
 FROM sessions
 ORDER BY created_at DESC;
 ```
 
-**See complete event history for a session:**
+**Complete event history for one session:**
 ```sql
 SELECT event_type, event_timestamp, data
 FROM session_events
@@ -189,81 +320,104 @@ WHERE session_id = 1
 ORDER BY event_timestamp ASC;
 ```
 
-**See all suspect sessions:**
+**Sessions flagged for ops review (estimated billing):**
 ```sql
-SELECT session_uuid, charger_id, 
-       estimated_energy_kwh, estimated_amount_inr
+SELECT session_uuid, charger_id,
+       total_energy_kwh, total_amount_inr
 FROM sessions
-WHERE status = 'suspect';
+WHERE is_estimated = TRUE;
 ```
 
-**See billing records:**
+**Billing records:**
 ```sql
-SELECT s.session_uuid, b.energy_kwh, 
-       b.amount_inr, b.payment_status, b.is_estimated
+SELECT s.session_uuid, s.charger_id,
+       b.energy_kwh, b.amount_inr,
+       b.is_estimated, b.payment_status
 FROM billing b
-JOIN sessions s ON s.id = b.session_id;
+JOIN sessions s ON s.id = b.session_id
+ORDER BY b.created_at DESC;
 ```
 
 ---
 
-## Resetting the database (fresh start)
-
-To wipe all data and start again:
+## Resetting to a clean state
 
 ```bash
 docker-compose down -v
 docker-compose up -d
 ```
 
-The `-v` flag removes the PostgreSQL volume.
-All tables and seed data are recreated automatically.
+The `-v` flag removes the PostgreSQL data volume. All tables and seed data are recreated automatically on next start.
 
 ---
 
-## Key concepts demonstrated
+## What is NOT in this repo (production additions)
 
-### State machine
-Every session follows a strict state machine.
-Invalid transitions are rejected (idempotency).
+This is a local simulation. A production deployment would add:
 
-### Atomicity
-Every function wraps its database writes in a transaction.
-Session state update + event log either both succeed or both fail.
-
-### Idempotency
-Every state transition checks current state before updating.
-Duplicate messages from chargers never corrupt the database.
-
-### Audit trail
-Every state change is logged to `session_events`.
-Complete reconstruction of any session is always possible.
-
-### Estimated billing
-When a charger drops, the system estimates billing from last known state.
-When charger reconnects, estimated value is reconciled against actual.
-Estimated sessions are flagged for ops team review.
+| Component | Purpose |
+|-----------|---------|
+| FastAPI gateway | Accept real OCPP WebSocket connections from chargers |
+| River Queue workers | Automatically monitor sessions, trigger suspect detection, retry billing |
+| PgBouncer | Connection pooler between gateway and PostgreSQL |
+| AWS RDS | Managed PostgreSQL with automated backups and read replicas |
+| AWS ALB | Load balancer distributing charger connections across gateway instances |
+| Grafana + CloudWatch | Dashboard for session monitoring, charger health, billing alerts |
+| CI/CD pipeline | GitHub Actions → Docker build → ECR → ECS deployment |
 
 ---
 
-## Production architecture
+## Production architecture (reference)
 
-This local setup maps to production as follows:
+```
+Chargers (highway)
+    │ wss:// OCPP WebSocket
+    ▼
+AWS ALB (load balancer)
+    │
+    ├──► Gateway EC2 t3.medium (holds ~1,000 WebSocket connections)
+    └──► Gateway EC2 t3.medium (holds ~1,000 WebSocket connections)
+              │
+              │ psycopg2
+              ▼
+         PgBouncer (connection pooler)
+              │
+              ▼
+         AWS RDS PostgreSQL db.t3.medium (primary — writes)
+              │
+              └──► RDS Read Replica (workers and dashboard reads)
+              
+River Queue Workers (separate EC2 or ECS tasks)
+    ├── Session Monitor Worker  (detects no MeterValues → mark suspect)
+    ├── Alert Worker            (closes suspect sessions after 30 min)
+    ├── Billing Worker          (processes payments, retries on failure)
+    └── Command Dispatcher      (reads command_queue, pushes to chargers)
 
-| Local | Production |
-|-------|-----------|
-| Docker PostgreSQL | AWS RDS PostgreSQL t3.medium |
-| Direct Python calls | FastAPI WebSocket gateway |
-| Manual function calls | River Queue background workers |
-| pgAdmin | Grafana + CloudWatch dashboard |
-
----
-
-## Stopping the project
-
-```bash
-docker-compose down
+Mobile App / Dashboard
+    │ REST API
+    ▼
+FastAPI API Server (separate from gateway)
+    │
+    ▼
+Same PostgreSQL RDS
 ```
 
-Data is preserved in the Docker volume.
-Next `docker-compose up -d` restores everything.
+---
+
+## Concepts demonstrated
+
+| Concept | Where in code |
+|---------|--------------|
+| State machine | `cms_backend.py` — every function checks current state before transitioning |
+| Atomicity | Every function: state update + event log commit together or both roll back |
+| Idempotency | Every UPDATE has a WHERE clause checking current state — safe for charger retries |
+| Audit trail | `session_events` table — append-only, complete reconstruction always possible |
+| Estimated billing | `mark_suspect()` — calculates energy from last known power × elapsed time |
+| Reconciliation | `stop_charging()` — compares estimated vs actual, flags large differences |
+| Connection safety | `create_session()` — blocks duplicate sessions on same connector |
+
+---
+
+## Authors
+
+Built by Deepak Palaksha as a consulting deliverable for Massive Charging.
